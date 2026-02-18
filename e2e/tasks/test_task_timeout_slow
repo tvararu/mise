@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Test timeout via CLI flag (global timeout for entire run)
+cat <<EOF >mise.toml
+[tasks.task1]
+run = "sleep 1 && echo 'Task 1 done'"
+
+[tasks.task2]
+run = "sleep 1 && echo 'Task 2 done'"
+
+[tasks.task3]
+run = "sleep 5 && echo 'Task 3 should not appear'"
+EOF
+
+echo "Testing global timeout via CLI flag..."
+if mise run --timeout=3s task1 ::: task2 ::: task3 2>&1; then
+	echo "ERROR: Tasks should have timed out"
+	exit 1
+fi
+echo "✓ CLI flag global timeout works"
+
+# Test timeout via task config (individual task timeout)
+cat <<EOF >mise.toml
+[tasks.quick]
+run = "echo 'Quick task'"
+timeout = "5s"
+
+[tasks.slow]
+run = "sleep 2 && echo 'Slow task done'"
+timeout = "5s"
+
+[tasks.too_slow]
+run = "sleep 3 && echo 'Should not appear'"
+timeout = "1s"
+EOF
+
+echo "Testing individual task timeout (too_slow should fail)..."
+assert_fail "mise run too_slow" "timed out"
+
+echo "Testing task succeeds within its timeout..."
+assert_succeed "mise run quick"
+assert_succeed "mise run slow"
+
+# Test settings timeout acts as default and task timeout overrides it
+cat <<EOF >mise.toml
+[settings]
+task_timeout = "500ms"
+
+[tasks.override]
+run = "sleep 1 && echo 'Override done'"
+timeout = "5s"
+
+[tasks.defaulted]
+run = "sleep 2 && echo 'Should not appear'"
+EOF
+
+echo "Testing task timeout overrides settings timeout..."
+assert_succeed "mise run override"
+
+echo "Testing settings timeout applies when task timeout is absent..."
+assert_fail "mise run defaulted" "timed out"
+
+# Test CLI timeout overrides per-task timeout as a run-wide ceiling
+cat <<EOF >mise.toml
+[tasks.cli_override]
+run = "sleep 2 && echo 'Should not appear'"
+timeout = "5s"
+EOF
+
+echo "Testing --timeout overrides per-task timeout..."
+assert_fail "mise run --timeout=500ms cli_override" "timed out"
+
+# Test task timeout is independent per task
+cat <<EOF >mise.toml
+[tasks.parallel1]
+run = "sleep 2 && echo 'Parallel 1 done'"
+timeout = "3s"
+
+[tasks.parallel2]
+run = "sleep 2 && echo 'Parallel 2 done'"
+timeout = "3s"
+EOF
+
+echo "Testing parallel tasks with individual timeouts..."
+assert_succeed "mise run parallel1 ::: parallel2"
+
+# Test using duration formats
+cat <<EOF >mise.toml
+[tasks.duration_test]
+run = "sleep 1 && echo 'Duration test done'"
+timeout = "2s"
+EOF
+
+echo "Testing duration format in task timeout..."
+assert_succeed "mise run duration_test"
+
+echo "All timeout tests passed!"

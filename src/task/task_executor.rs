@@ -628,11 +628,19 @@ impl TaskExecutor {
         let program = program.to_executable();
         let redactions = config.redactions();
         let raw = self.raw(Some(task));
+        let task_timeout = task
+            .timeout
+            .as_ref()
+            .map(|s| s.as_str())
+            .or(Settings::get().task_timeout.as_deref())
+            .map(crate::duration::parse_duration)
+            .transpose()?;
         let mut cmd = CmdLineRunner::new(program.clone())
             .args(args)
             .envs(env)
             .redact(redactions.deref().clone())
-            .raw(raw);
+            .raw(raw)
+            .timeout(task_timeout);
         if raw && !redactions.is_empty() {
             hint!(
                 "raw_redactions",

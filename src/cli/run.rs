@@ -315,12 +315,13 @@ impl Run {
         }
         time!("run get_task_lists");
 
-        // Apply global timeout for entire run if configured
-        let timeout = if let Some(timeout_str) = &self.timeout {
-            Some(duration::parse_duration(timeout_str)?)
-        } else {
-            Settings::get().task_timeout_duration()
-        };
+        // Apply global timeout for entire run only when explicitly requested via CLI.
+        // `task_timeout` setting/env acts as a per-task default and is applied in spawn_sched_job.
+        let timeout = self
+            .timeout
+            .as_ref()
+            .map(|timeout_str| duration::parse_duration(timeout_str))
+            .transpose()?;
 
         if let Some(timeout) = timeout {
             tokio::time::timeout(timeout, self.parallelize_tasks(config, task_list))

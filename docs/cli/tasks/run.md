@@ -135,7 +135,7 @@ Run only the specified tasks skipping all dependencies
 
 ### `--timeout <TIMEOUT>`
 
-Timeout for the task to complete
+Timeout for the entire `mise run` invocation
 e.g.: 30s, 5m
 
 Examples:

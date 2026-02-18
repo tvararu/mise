@@ -7,11 +7,12 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
+use std::time::Duration;
 
 use crate::redactions::Redactor;
 use color_eyre::Result;
 use duct::{Expression, IntoExecutablePath};
-use eyre::Context;
+use eyre::{Context, bail};
 #[cfg(not(any(test, target_os = "windows")))]
 use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
 #[cfg(not(any(test, target_os = "windows")))]
@@ -105,6 +106,7 @@ pub struct CmdLineRunner<'a> {
     redactor: Redactor,
     raw: bool,
     pass_signals: bool,
+    timeout: Option<Duration>,
     on_stdout: Option<Box<dyn Fn(String) + Send + 'a>>,
     on_stderr: Option<Box<dyn Fn(String) + Send + 'a>>,
 }
@@ -128,6 +130,7 @@ impl<'a> CmdLineRunner<'a> {
             redactor: Default::default(),
             raw: false,
             pass_signals: false,
+            timeout: None,
             on_stdout: None,
             on_stderr: None,
         }
@@ -283,6 +286,11 @@ impl<'a> CmdLineRunner<'a> {
         self
     }
 
+    pub fn timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
     pub fn stdin_string(mut self, input: impl Into<String>) -> Self {
         self.cmd.stdin(Stdio::piped());
         self.stdin = Some(input.into());
@@ -313,7 +321,9 @@ impl<'a> CmdLineRunner<'a> {
                 move || {
                     for line in BufReader::new(stdout).lines() {
                         match line {
-                            Ok(line) => tx.send(ChildProcessOutput::Stdout(line)).unwrap(),
+                            Ok(line) => {
+                                let _ = tx.send(ChildProcessOutput::Stdout(line));
+                            }
                             Err(e) => warn!("Failed to read stdout for {name}: {e}"),
                         }
                     }
@@ -327,7 +337,9 @@ impl<'a> CmdLineRunner<'a> {
                 move || {
                     for line in BufReader::new(stderr).lines() {
                         match line {
-                            Ok(line) => tx.send(ChildProcessOutput::Stderr(line)).unwrap(),
+                            Ok(line) => {
+                                let _ = tx.send(ChildProcessOutput::Stderr(line));
+                            }
                             Err(e) => warn!("Failed to read stderr for {name}: {e}"),
                         }
                     }
@@ -350,8 +362,15 @@ impl<'a> CmdLineRunner<'a> {
             let tx = tx.clone();
             thread::spawn(move || {
                 for sig in &mut signals {
-                    tx.send(ChildProcessOutput::Signal(sig)).unwrap();
+                    let _ = tx.send(ChildProcessOutput::Signal(sig));
                 }
+            });
+        }
+        if let Some(timeout) = self.timeout {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                thread::sleep(timeout);
+                let _ = tx.send(ChildProcessOutput::Timeout(timeout));
             });
         }
         thread::spawn(move || {
@@ -360,12 +379,12 @@ impl<'a> CmdLineRunner<'a> {
             if let Some(sighandle) = sighandle {
                 sighandle.close();
             }
-            tx.send(ChildProcessOutput::ExitStatus(status)).unwrap();
+            let _ = tx.send(ChildProcessOutput::ExitStatus(status));
         });
 
         let mut combined_output = vec![];
         let mut status = None;
-        for line in rx {
+        while let Ok(line) = rx.recv() {
             match line {
                 ChildProcessOutput::Stdout(line) => {
                     let line = self.redactor.redact(&line);
@@ -380,6 +399,25 @@ impl<'a> CmdLineRunner<'a> {
                 ChildProcessOutput::ExitStatus(s) => {
                     RUNNING_PIDS.lock().unwrap().remove(&id);
                     status = Some(s);
+                    break;
+                }
+                ChildProcessOutput::Timeout(timeout) => {
+                    #[cfg(unix)]
+                    {
+                        let pid = nix::unistd::Pid::from_raw(id as i32);
+                        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+                    }
+                    #[cfg(windows)]
+                    {
+                        let _ = Command::new("taskkill")
+                            .arg("/F")
+                            .arg("/T")
+                            .arg("/PID")
+                            .arg(id.to_string())
+                            .spawn();
+                    }
+                    RUNNING_PIDS.lock().unwrap().remove(&id);
+                    bail!("timed out after {timeout:?}");
                 }
                 #[cfg(not(any(test, windows)))]
                 ChildProcessOutput::Signal(sig) => {
@@ -390,6 +428,21 @@ impl<'a> CmdLineRunner<'a> {
                         nix::sys::signal::kill(pid, sig)?;
                     }
                 }
+            }
+        }
+        while let Ok(line) = rx.try_recv() {
+            match line {
+                ChildProcessOutput::Stdout(line) => {
+                    let line = self.redactor.redact(&line);
+                    self.on_stdout(line.clone());
+                    combined_output.push(line);
+                }
+                ChildProcessOutput::Stderr(line) => {
+                    let line = self.redactor.redact(&line);
+                    self.on_stderr(line.clone());
+                    combined_output.push(line);
+                }
+                _ => {}
             }
         }
         RUNNING_PIDS.lock().unwrap().remove(&id);
@@ -532,6 +585,7 @@ enum ChildProcessOutput {
     Stdout(String),
     Stderr(String),
     ExitStatus(ExitStatus),
+    Timeout(Duration),
     #[cfg(not(any(test, target_os = "windows")))]
     Signal(i32),
 }
