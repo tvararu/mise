@@ -393,7 +393,8 @@ impl<'a> CmdLineRunner<'a> {
                 {
                     let pid = nix::unistd::Pid::from_raw(pid as i32);
                     let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
-                    let (_guard, result) = cvar.wait_timeout(guard, Duration::from_secs(5)).unwrap();
+                    let (_guard, result) =
+                        cvar.wait_timeout(guard, Duration::from_secs(5)).unwrap();
                     if result.timed_out() {
                         let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
                     }
