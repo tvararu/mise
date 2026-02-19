@@ -4,14 +4,16 @@ use std::fmt::{Debug, Display, Formatter};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
+use std::time::Duration;
 
 use crate::redactions::Redactor;
 use color_eyre::Result;
 use duct::{Expression, IntoExecutablePath};
-use eyre::Context;
+use eyre::{Context, bail};
 #[cfg(not(any(test, target_os = "windows")))]
 use signal_hook::consts::{SIGHUP, SIGINT, SIGQUIT, SIGTERM, SIGUSR1, SIGUSR2};
 #[cfg(not(any(test, target_os = "windows")))]
@@ -107,6 +109,7 @@ pub struct CmdLineRunner<'a> {
     pass_signals: bool,
     on_stdout: Option<Box<dyn Fn(String) + Send + 'a>>,
     on_stderr: Option<Box<dyn Fn(String) + Send + 'a>>,
+    timeout: Option<Duration>,
 }
 
 static OUTPUT_LOCK: Mutex<()> = Mutex::new(());
@@ -130,6 +133,7 @@ impl<'a> CmdLineRunner<'a> {
             pass_signals: false,
             on_stdout: None,
             on_stderr: None,
+            timeout: None,
         }
     }
 
@@ -283,6 +287,11 @@ impl<'a> CmdLineRunner<'a> {
         self
     }
 
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
     pub fn stdin_string(mut self, input: impl Into<String>) -> Self {
         self.cmd.stdin(Stdio::piped());
         self.stdin = Some(input.into());
@@ -363,6 +372,43 @@ impl<'a> CmdLineRunner<'a> {
             tx.send(ChildProcessOutput::ExitStatus(status)).unwrap();
         });
 
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new((Mutex::new(false), Condvar::new()));
+        if let Some(timeout) = self.timeout {
+            let timed_out = timed_out.clone();
+            let cancel = cancel.clone();
+            let pid = id;
+            thread::spawn(move || {
+                let (lock, cvar) = &*cancel;
+                let guard = lock.lock().unwrap();
+                if *guard {
+                    return;
+                }
+                let (guard, wait_result) = cvar.wait_timeout(guard, timeout).unwrap();
+                if !wait_result.timed_out() {
+                    return;
+                }
+                timed_out.store(true, Ordering::Release);
+                #[cfg(unix)]
+                {
+                    let pid = nix::unistd::Pid::from_raw(pid as i32);
+                    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+                    let (_guard, result) = cvar.wait_timeout(guard, Duration::from_secs(5)).unwrap();
+                    if result.timed_out() {
+                        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    let _ = Command::new("taskkill")
+                        .args(["/F", "/PID", &pid.to_string()])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            });
+        }
+
         let mut combined_output = vec![];
         let mut status = None;
         for line in rx {
@@ -393,6 +439,16 @@ impl<'a> CmdLineRunner<'a> {
             }
         }
         RUNNING_PIDS.lock().unwrap().remove(&id);
+        {
+            let (lock, cvar) = &*cancel;
+            *lock.lock().unwrap() = true;
+            cvar.notify_one();
+        }
+
+        if timed_out.load(Ordering::Acquire) {
+            bail!("timed out after {:?}", self.timeout.unwrap());
+        }
+
         let status = status.unwrap();
 
         if !status.success() {

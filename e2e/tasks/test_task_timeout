@@ -35,11 +35,17 @@ run = "sleep 10 && echo 'Should not appear'"
 timeout = "1s"
 EOF
 
-# TODO: Individual task timeouts are not yet implemented
-echo "⚠ Skipping individual task timeout test (not implemented yet)"
+echo "Testing individual task timeout (too_slow should time out)..."
+if mise run too_slow 2>&1; then
+	echo "ERROR: too_slow should have timed out"
+	exit 1
+fi
+echo "✓ Individual task timeout works"
 
-# TODO: Individual task timeouts are not yet implemented
-echo "⚠ Skipping successful task within timeout test (not implemented yet)"
+echo "Testing task completes within timeout..."
+mise run quick 2>&1
+mise run slow 2>&1
+echo "✓ Tasks within timeout complete successfully"
 
 # Test timeout via environment variable (global)
 cat <<EOF >mise.toml
@@ -68,8 +74,9 @@ run = "sleep 2 && echo 'Parallel 2 done'"
 timeout = "3s"
 EOF
 
-# TODO: Individual task timeouts are not yet implemented
-echo "⚠ Skipping parallel tasks with individual timeouts test (not implemented yet)"
+echo "Testing parallel tasks with individual timeouts..."
+mise run parallel1 ::: parallel2 2>&1
+echo "✓ Parallel tasks with individual timeouts work"
 
 # Test using duration formats
 cat <<EOF >mise.toml
@@ -78,7 +85,8 @@ run = "sleep 1 && echo 'Duration test done'"
 timeout = "2s"
 EOF
 
-# TODO: Individual task timeouts are not yet implemented
-echo "⚠ Skipping duration formats test (not implemented yet)"
+echo "Testing duration format parsing..."
+mise run duration_test 2>&1
+echo "✓ Duration format works"
 
 echo "All timeout tests passed!"
